@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: clear-command-docs
+  namespace: default
+  labels:
+    app: clear-command-docs
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: http
+    protocol: TCP
+    name: http
+  selector:
+    app: clear-command-docs
+  sessionAffinity: None
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clear-command-docs
+  namespace: default
+  labels:
+    app: clear-command-docs
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clear-command-config
+  namespace: default
+  labels:
+    app: clear-command-docs
+data:
+  api-url: "https://api.example.com"
+  environment: "production"
+  log-level: "info"
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: clear-command-docs-pdb
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: clear-command-docs

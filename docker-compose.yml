@@ -1,0 +1,66 @@
+version: '3.9'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: clear-command-docs-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:3000/api
+    volumes:
+      # Montar código fuente para hot reload
+      - .:/app
+      # Excluir node_modules
+      - /app/node_modules
+      - /app/dist
+    networks:
+      - clear-command-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # Opcional: API Laravel en desarrollo
+  # api:
+  #   image: php:8.3-fpm-alpine
+  #   container_name: clear-command-api-dev
+  #   working_dir: /var/www
+  #   volumes:
+  #     - ../laravel-api:/var/www
+  #   networks:
+  #     - clear-command-network
+  #   environment:
+  #     - DB_CONNECTION=pgsql
+  #     - DB_HOST=postgres
+  #     - DB_PORT=5432
+  #   depends_on:
+  #     - postgres
+  #
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: clear-command-postgres-dev
+  #   environment:
+  #     - POSTGRES_DB=clear_command
+  #     - POSTGRES_USER=developer
+  #     - POSTGRES_PASSWORD=dev_password
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - clear-command-network
+
+networks:
+  clear-command-network:
+    driver: bridge
+
+# volumes:
+#   postgres_data:
+#     driver: local

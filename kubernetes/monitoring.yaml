@@ -1,0 +1,122 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: clear-command-docs
+  namespace: default
+  labels:
+    app: clear-command-docs
+spec:
+  selector:
+    matchLabels:
+      app: clear-command-docs
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: clear-command-docs-alerts
+  namespace: default
+  labels:
+    application: clear-command-docs
+spec:
+  groups:
+  - name: clear-command-docs.rules
+    interval: 30s
+    rules:
+    - alert: ApplicationDown
+      expr: up{job="clear-command-docs"} == 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Clear Command Docs is down"
+        description: "Clear Command Docs service is not responding"
+
+    - alert: HighErrorRate
+      expr: |
+        (sum(rate(http_requests_total{job="clear-command-docs",status=~"5.."}[5m])) 
+        / sum(rate(http_requests_total{job="clear-command-docs"}[5m]))) > 0.05
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is above 5% for Clear Command Docs"
+
+    - alert: HighMemoryUsage
+      expr: |
+        (container_memory_usage_bytes{pod=~"clear-command-docs-.*"} 
+        / container_spec_memory_limit_bytes{pod=~"clear-command-docs-.*"}) > 0.85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High memory usage"
+        description: "Memory usage is above 85% for {{ $labels.pod }}"
+
+    - alert: HighCPUUsage
+      expr: |
+        (rate(container_cpu_usage_seconds_total{pod=~"clear-command-docs-.*"}[5m]) 
+        / container_spec_cpu_quota{pod=~"clear-command-docs-.*"}) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High CPU usage"
+        description: "CPU usage is above 80% for {{ $labels.pod }}"
+
+    - alert: SlowResponseTime
+      expr: |
+        histogram_quantile(0.99, 
+          sum(rate(http_request_duration_seconds_bucket{job="clear-command-docs"}[5m])) 
+          by (le)) > 1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Slow response time"
+        description: "P99 response time is above 1 second"
+
+    - alert: PodCrashLooping
+      expr: |
+        increase(kube_pod_container_status_restarts_total{pod=~"clear-command-docs-.*"}[15m]) > 5
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod is crash looping"
+        description: "Pod {{ $labels.pod }} has crashed {{ $value }} times in 15 minutes"
+
+    - alert: DiskUsageHigh
+      expr: |
+        (node_filesystem_avail_bytes{fstype=~"ext4|xfs",mountpoint="/"} 
+        / node_filesystem_size_bytes{fstype=~"ext4|xfs",mountpoint="/"}) < 0.15
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Disk usage is high"
+        description: "Less than 15% disk space available on {{ $labels.node }}"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-alerts
+  namespace: monitoring
+data:
+  alerts.yaml: |
+    groups:
+    - name: slack-notifications
+      rules:
+      - alert: ClearCommandDocsAlert
+        expr: ALERTS{alertname=~"ApplicationDown|HighErrorRate"}
+        annotations:
+          slack_message: |
+            :warning: {{ $labels.alertname }}
+            Severity: {{ $labels.severity }}
+            Details: {{ .Annotations.description }}

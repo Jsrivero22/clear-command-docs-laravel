@@ -1,0 +1,38 @@
+# Dockerfile for Development
+FROM node:24-slim
+
+WORKDIR /app
+
+# Instalar curl para health checks y otros utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar archivos de dependencias
+COPY package.json bun.lockb ./
+
+# Instalar todas las dependencias (incluyendo dev)
+RUN npm ci
+
+# Copiar código fuente
+COPY . .
+
+# Crear usuario no-root
+RUN groupadd -r nodeuser && useradd -r -g nodeuser nodeuser && \
+    chown -R nodeuser:nodeuser /app
+
+USER nodeuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080 || exit 1
+
+# Variables de entorno
+ENV NODE_ENV=development
+
+# Puerto para dev server
+EXPOSE 8080
+
+# Ejecutar dev server con hot reload
+CMD ["npm", "run", "dev"]

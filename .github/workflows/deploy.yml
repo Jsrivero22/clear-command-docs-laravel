@@ -1,0 +1,336 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip-tests:
+        description: 'Skip tests (use with caution)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Opcional - correr tests si no se skippean
+  verify:
+    if: ${{ !inputs.skip-tests }}
+    name: Verify Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Build application
+        run: npm run build
+
+  build-and-push:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ verify ]
+    if: always()
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "tag=${TAG}" >> $GITHUB_OUTPUT
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            TAG=${{ github.event.inputs.environment }}-$(date +%Y%m%d-%H%M%S)
+            echo "tag=${TAG}" >> $GITHUB_OUTPUT
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        if: always()
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ build-and-push ]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT || 22 }}
+          script: |
+            cd ${{ secrets.STAGING_APP_PATH }}
+            
+            # Pull latest changes
+            git pull origin develop
+            
+            # Pull Docker image
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-$(date +%Y%m%d-%H%M%S)
+            
+            # Stop current containers
+            docker-compose -f docker-compose.prod.yml down
+            
+            # Update environment file
+            echo "ENVIRONMENT=staging" > .env
+            echo "VITE_API_URL=${{ secrets.STAGING_API_URL }}" >> .env
+            
+            # Start new containers
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            # Run health checks
+            sleep 10
+            docker-compose -f docker-compose.prod.yml ps
+
+      - name: Run smoke tests
+        run: |
+          curl -f http://${{ secrets.STAGING_HOST }}/health || exit 1
+
+      - name: Notify Slack - Staging Success
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ Staging Deployment Successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Successful - Staging*\n*Environment:* Staging\n*URL:* http://${{ secrets.STAGING_HOST }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ build-and-push ]
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=production-$(date +%Y%m%d-%H%M%S)
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create backup
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          script: |
+            cd ${{ secrets.PROD_APP_PATH }}
+            
+            # Create backup
+            BACKUP_DIR="backups/backup-$(date +%Y%m%d-%H%M%S)"
+            mkdir -p $BACKUP_DIR
+            docker-compose -f docker-compose.prod.yml logs > $BACKUP_DIR/logs.txt
+            cp docker-compose.prod.yml $BACKUP_DIR/ || true
+            
+            echo "Backup created at $BACKUP_DIR"
+
+      - name: Blue-Green Deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          script: |
+            cd ${{ secrets.PROD_APP_PATH }}
+            
+            # Pull latest code
+            git pull origin main
+            
+            # Update environment
+            echo "ENVIRONMENT=production" > .env
+            echo "VITE_API_URL=${{ secrets.PROD_API_URL }}" >> .env
+            
+            # Pull and start new version
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d --scale app=2
+            
+            # Wait for health checks
+            sleep 15
+            
+            # Verify deployment
+            docker-compose -f docker-compose.prod.yml ps
+            
+            # Check if both containers are healthy
+            HEALTHY=$(docker ps --filter "health=healthy" | wc -l)
+            if [ $HEALTHY -lt 2 ]; then
+              echo "Deployment health check failed!"
+              exit 1
+            fi
+
+      - name: Run production smoke tests
+        run: |
+          curl -f https://${{ secrets.PROD_HOST }}/health || exit 1
+          curl -f https://${{ secrets.PROD_API_URL }}/health || exit 1
+
+      - name: Notify Slack - Production Success
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚀 Production Deployment Successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Successful - Production*\n*Version:* ${{ steps.version.outputs.version }}\n*URL:* https://${{ secrets.PROD_HOST }}\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+
+  rollback-deployment:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    if: failure() && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    needs: [ deploy-production ]
+
+    steps:
+      - name: Rollback Production
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          script: |
+            cd ${{ secrets.PROD_APP_PATH }}
+            
+            # Restore previous version
+            git revert --no-edit HEAD
+            git push origin main
+            
+            # Restart with previous image
+            docker-compose -f docker-compose.prod.yml down
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            echo "Rollback completed"
+
+      - name: Notify Slack - Rollback
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ Production Rollback Initiated",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production rollback was initiated*\n*Version:* ${{ github.ref }}\n*Details:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
